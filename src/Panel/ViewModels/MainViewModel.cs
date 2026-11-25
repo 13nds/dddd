@@ -11,6 +11,8 @@ using RobloxAutoManager.Panel.Views;
 
 public sealed class MainViewModel : INotifyPropertyChanged
 {
+    private const string RemovedSignal = "__REMOVED__";
+
     private readonly IAccountWatcher _watcher;
     private readonly ILogService _logs;
     private readonly Func<AddAccountDialog> _dialogFactory;
@@ -63,20 +65,43 @@ public sealed class MainViewModel : INotifyPropertyChanged
         StartWatchCommand = new RelayCommand(
             async () =>
             {
-                await _watcher.StartWatchingAsync();
-                _isWatching = true;
-                StatusMessage = $"Watching {Accounts.Count} accounts...";
-                _logs.Log(LogLevel.Info, "Panel", "Watcher started by operator.");
+                try
+                {
+                    await _watcher.StartWatchingAsync();
+                    _isWatching = true;
+                    StatusMessage = $"Watching {Accounts.Count} accounts...";
+                    _logs.Log(LogLevel.Info, "Panel", "Watcher started by operator.");
+                }
+                catch (Exception ex)
+                {
+                    StatusMessage = $"Start failed: {ex.Message}";
+                    _logs.Log(LogLevel.Error, "Panel", "Start failed", details: ex.ToString());
+                }
+                finally
+                {
+                    CommandManager.InvalidateRequerySuggested();
+                }
             },
             () => !_isWatching && Accounts.Count > 0);
 
         StopWatchCommand = new RelayCommand(
             async () =>
             {
-                await _watcher.StopWatchingAsync();
-                _isWatching = false;
-                StatusMessage = "Watcher stopped.";
-                _logs.Log(LogLevel.Info, "Panel", "Watcher stopped by operator.");
+                try
+                {
+                    await _watcher.StopWatchingAsync();
+                    _isWatching = false;
+                    StatusMessage = "Watcher stopped.";
+                    _logs.Log(LogLevel.Info, "Panel", "Watcher stopped by operator.");
+                }
+                catch (Exception ex)
+                {
+                    StatusMessage = $"Stop failed: {ex.Message}";
+                }
+                finally
+                {
+                    CommandManager.InvalidateRequerySuggested();
+                }
             },
             () => _isWatching);
 
@@ -85,9 +110,16 @@ public sealed class MainViewModel : INotifyPropertyChanged
             {
                 if (SelectedAccount is null) return;
                 string name = SelectedAccount.Username;
-                await _watcher.RemoveAccountAsync(name);
-                _logs.Log(LogLevel.Info, "Panel", $"Account removed: {name}", name);
-                StatusMessage = $"Removed {name}";
+
+                try
+                {
+                    await _watcher.RemoveAccountAsync(name);
+                    StatusMessage = $"Removed {name}";
+                }
+                catch (Exception ex)
+                {
+                    StatusMessage = $"Remove failed: {ex.Message}";
+                }
             },
             () => SelectedAccount is not null);
 
@@ -102,26 +134,36 @@ public sealed class MainViewModel : INotifyPropertyChanged
 
     private void OnAddAccount()
     {
-        var dlg = _dialogFactory();
-        if (dlg.ShowDialog() != true || dlg.Result is null) return;
-
-        var account = dlg.Result;
-
-        if (Accounts.Any(a => a.Username.Equals(account.Username, StringComparison.OrdinalIgnoreCase)))
+        try
         {
-            StatusMessage = $"{account.Username} already exists.";
-            _logs.Log(LogLevel.Warning, "Panel", "Duplicate add rejected", account.Username);
-            return;
-        }
+            var dlg = _dialogFactory();
+            if (dlg.ShowDialog() != true || dlg.Result is null) return;
 
-        _ = _watcher.AddAccountAsync(account);
-        _logs.Log(LogLevel.Info, "Panel", $"Account added: {account.Username}", account.Username);
-        StatusMessage = $"Added {account.Username}";
+            var account = dlg.Result;
+
+            if (Accounts.Any(a => a.Username.Equals(account.Username, StringComparison.OrdinalIgnoreCase)))
+            {
+                StatusMessage = $"{account.Username} already exists.";
+                _logs.Log(LogLevel.Warning, "Panel", "Duplicate add rejected", account.Username);
+                return;
+            }
+
+            _ = _watcher.AddAccountAsync(account);
+            StatusMessage = $"Added {account.Username}. Set a Place ID in Settings.";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Add failed: {ex.Message}";
+            _logs.Log(LogLevel.Error, "Panel", "Add account failed", details: ex.ToString());
+        }
     }
 
     private void OnAccountStateChanged(Account account)
     {
-        System.Windows.Application.Current?.Dispatcher.Invoke(() =>
+        var app = System.Windows.Application.Current;
+        if (app is null) return;
+
+        void Apply()
         {
             int idx = -1;
             for (int i = 0; i < Accounts.Count; i++)
@@ -133,21 +175,27 @@ public sealed class MainViewModel : INotifyPropertyChanged
                 }
             }
 
+            bool isRemoval = account.LastError == RemovedSignal;
+
+            if (isRemoval)
+            {
+                if (idx >= 0) Accounts.RemoveAt(idx);
+                StatusMessage = $"{account.Username} removed.";
+                CommandManager.InvalidateRequerySuggested();
+                return;
+            }
+
             if (idx >= 0)
-            {
-                if (account.State == AccountState.Offline && !Accounts.Contains(account))
-                    Accounts.RemoveAt(idx);
-                else
-                    Accounts[idx] = account;
-            }
+                Accounts[idx] = account;
             else
-            {
                 Accounts.Add(account);
-            }
 
             StatusMessage = $"{account.Username} → {account.State}";
             CommandManager.InvalidateRequerySuggested();
-        });
+        }
+
+        if (app.Dispatcher.CheckAccess()) Apply();
+        else app.Dispatcher.Invoke(Apply);
     }
 
     public void ForceQuit() => RequestForceQuit?.Invoke();

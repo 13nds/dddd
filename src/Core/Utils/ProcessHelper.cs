@@ -1,13 +1,22 @@
+// src/Core/Utils/ProcessHelper.cs
 namespace RobloxAutoManager.Core.Utils;
 
 using System.Diagnostics;
-using System.Runtime.InteropServices;
 
 public static class ProcessHelper
 {
     public static bool IsProcessRunning(string processName)
     {
-        return Process.GetProcessesByName(processName).Length > 0;
+        var procs = Process.GetProcessesByName(processName);
+        try { return procs.Length > 0; }
+        finally { foreach (var p in procs) p.Dispose(); }
+    }
+
+    public static int CountProcesses(string processName)
+    {
+        var procs = Process.GetProcessesByName(processName);
+        try { return procs.Length; }
+        finally { foreach (var p in procs) p.Dispose(); }
     }
 
     public static void KillProcessTree(string processName)
@@ -20,15 +29,15 @@ public static class ProcessHelper
         }
     }
 
-    public static string GetHwid() => HardwareId.Value;
+    public static void KillByPid(int pid)
     {
-        // Basit HWID: MachineGuid + CPU ID hash
-        string machineId = Environment.MachineName;
-        string userDomain = Environment.UserDomainName;
-        string raw = $"{machineId}|{userDomain}|{RuntimeInformation.OSArchitecture}";
-        
-        using var sha = System.Security.Cryptography.SHA256.Create();
-        byte[] hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(raw));
-        return Convert.ToHexString(hash)[..32]; // İlk 32 hex char
+        try
+        {
+            using var proc = Process.GetProcessById(pid);
+            proc.Kill(entireProcessTree: true);
+        }
+        catch { /* gone */ }
     }
+
+    public static string GetHwid() => HardwareId.Value;
 }

@@ -7,7 +7,6 @@ using System.Windows.Threading;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
 using Microsoft.Extensions.Logging;
-using RobloxAutoManager.Core.Models;
 using RobloxAutoManager.Core.Services;
 using RobloxAutoManager.Core.Utils;
 using RobloxAutoManager.Panel.Auth;
@@ -18,6 +17,7 @@ using RobloxAutoManager.Watcher;
 using RobloxAutoManager.Watcher.Auth;
 using RobloxAutoManager.Watcher.Http;
 using RobloxAutoManager.Watcher.RateLimiting;
+using AppLogLevel = RobloxAutoManager.Core.Models.LogLevel;
 
 public partial class App : Application
 {
@@ -51,8 +51,7 @@ public partial class App : Application
             await _host.StartAsync();
 
             var logs = _host.Services.GetRequiredService<ILogService>();
-            logs.Log(Core.Models.LogLevel.Info, "App",
-                $"Host started. HWID={HardwareId.Value[..16]}…");
+            logs.Log(AppLogLevel.Info, "App", $"Host started. HWID={HardwareId.Value[..16]}…");
 
             WireCookieRotationPersistence(logs);
 
@@ -64,17 +63,23 @@ public partial class App : Application
 
             _main = _host.Services.GetRequiredService<MainWindow>();
 
-            _tray = new TrayService(() =>
-            {
-                _main.Show();
-                _main.WindowState = WindowState.Normal;
-                _main.Activate();
-            });
+            _tray = new TrayService(
+                onShow: () =>
+                {
+                    _main.Show();
+                    _main.WindowState = WindowState.Normal;
+                    _main.Activate();
+                },
+                onExit: () =>
+                {
+                    _main.RequestForceClose();
+                    Shutdown(0);
+                });
 
             _main.Show();
-            ShutdownMode = ShutdownMode.OnMainWindowClose;
+            ShutdownMode = ShutdownMode.OnExplicitShutdown;
 
-            logs.Log(Core.Models.LogLevel.Info, "App", "Panel ready.");
+            logs.Log(AppLogLevel.Info, "App", "Panel ready.");
         }
         catch (Exception ex)
         {
@@ -90,9 +95,6 @@ public partial class App : Application
         }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  DI REGISTRATION
-    // ─────────────────────────────────────────────────────────────
     private static void ConfigureServices(IServiceCollection services)
     {
         // ── Observability ──────────────────────────────────────────
@@ -107,10 +109,7 @@ public partial class App : Application
         services.AddSingleton(sp =>
         {
             var handler = sp.GetRequiredService<RateLimitAwareHandler>();
-            return new HttpClient(handler)
-            {
-                Timeout = TimeSpan.FromSeconds(30)
-            };
+            return new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
         });
 
         services.AddSingleton(sp => new RobloxApiPipeline(
@@ -119,7 +118,7 @@ public partial class App : Application
             logs: sp.GetRequiredService<ILogService>(),
             logger: sp.GetRequiredService<ILogger<RobloxApiPipeline>>()));
 
-        // ── BATCH 1: Cookie rotation + auth ────────────────────────
+        // ── Cookie rotation + auth ─────────────────────────────────
         services.AddSingleton<CookieJar>();
         services.AddSingleton<RobloxAuthClient>();
 
@@ -130,6 +129,7 @@ public partial class App : Application
         services.AddSingleton<ICookieRefresher, CookieRefresher>();
 
         // ── License ────────────────────────────────────────────────
+        services.AddSingleton(LicenseApiConfig.FromEnvironment());
         services.AddSingleton<ILicenseValidator, RemoteLicenseValidator>();
 
         // ── Process isolation + launch ─────────────────────────────
@@ -142,9 +142,8 @@ public partial class App : Application
         services.AddTransient<AddAccountDialog>();
         services.AddTransient<LogViewer>();
         services.AddTransient<RateLimitMonitor>();
-        services.AddTransient<SettingsView>();
 
-        // ── UI: factories (captive dependency önlemi) ──────────────
+        // ── UI: factories ──────────────────────────────────────────
         services.AddSingleton<Func<AddAccountDialog>>(sp =>
             () => sp.GetRequiredService<AddAccountDialog>());
 
@@ -158,31 +157,21 @@ public partial class App : Application
         services.AddSingleton<MainWindow>();
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  COOKIE ROTATION → PERSISTENCE HOOK
-    // ─────────────────────────────────────────────────────────────
     private void WireCookieRotationPersistence(ILogService logs)
     {
         var jar = _host!.Services.GetRequiredService<CookieJar>();
 
-        // Batch 2'de EncryptedAccountStore bu event'e abone olup diske yazacak.
-        // Şimdilik rotasyonu logluyoruz — sessiz kayıp olmasın.
-        void OnRotated(CookieRotation rotation)
+        void OnRotated(Core.Models.CookieRotation rotation)
         {
-            logs.Log(Core.Models.LogLevel.Info, "Session",
-                $"Cookie rotated for {rotation.Username} at {rotation.At:HH:mm:ss}. " +
-                $"Persistence pending (Batch 2).",
+            logs.Log(AppLogLevel.Info, "Session",
+                $"Cookie rotated at {rotation.At:HH:mm:ss}. Persistence pending (Batch 2).",
                 rotation.Username);
         }
 
         jar.Rotated += OnRotated;
-
         _rotationSubscription = new ActionDisposable(() => jar.Rotated -= OnRotated);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  OAUTH CONFIG LOADING
-    // ─────────────────────────────────────────────────────────────
     private static OAuthClientConfig LoadOAuthConfig()
     {
         string clientId = Environment.GetEnvironmentVariable("RBX_CLIENT_ID") ?? "";
@@ -209,19 +198,13 @@ public partial class App : Application
                     if (root.TryGetProperty("redirect_uri", out var ru))
                         redirect = ru.GetString() ?? redirect;
                 }
-                catch
-                {
-                    // Bozuk config dosyası startup'ı öldürmesin — env/boş değerle devam
-                }
+                catch { /* bozuk config startup'ı öldürmesin */ }
             }
         }
 
         return new OAuthClientConfig(clientId, clientSecret, redirect);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  LICENSE GATE
-    // ─────────────────────────────────────────────────────────────
     private async Task<bool> AuthenticateAsync(ILogService logs)
     {
         var validator = _host!.Services.GetRequiredService<ILicenseValidator>();
@@ -231,17 +214,14 @@ public partial class App : Application
 
         if (result == true && login.IsAuthenticated)
         {
-            logs.Log(Core.Models.LogLevel.Info, "Auth", "License validated.");
+            logs.Log(AppLogLevel.Info, "Auth", "License validated.");
             return true;
         }
 
-        logs.Log(Core.Models.LogLevel.Warning, "Auth", "License gate rejected. Shutting down.");
+        logs.Log(AppLogLevel.Warning, "Auth", "License gate rejected. Shutting down.");
         return false;
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  GLOBAL EXCEPTION HANDLING
-    // ─────────────────────────────────────────────────────────────
     private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
     {
         TryLogFatal(e.Exception, "UI thread");
@@ -271,17 +251,13 @@ public partial class App : Application
         try
         {
             _host?.Services.GetService<ILogService>()?.Log(
-                Core.Models.LogLevel.Fatal,
-                "App",
+                AppLogLevel.Fatal, "App",
                 $"{origin}: {ex.GetType().Name} — {ex.Message}",
                 details: ex.ToString());
         }
         catch { /* host ölmüş olabilir */ }
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  TEARDOWN
-    // ─────────────────────────────────────────────────────────────
     protected override async void OnExit(ExitEventArgs e)
     {
         try
@@ -295,7 +271,7 @@ public partial class App : Application
                     await watcher.StopWatchingAsync();
 
                 _host.Services.GetService<ILogService>()?
-                    .Log(Core.Models.LogLevel.Info, "App", "Shutting down.");
+                    .Log(AppLogLevel.Info, "App", "Shutting down.");
 
                 await _host.StopAsync(TimeSpan.FromSeconds(5));
                 _host.Dispose();

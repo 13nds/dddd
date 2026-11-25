@@ -1,24 +1,33 @@
 // src/Watcher/CookieRefresher.cs
 namespace RobloxAutoManager.Watcher;
 
-using System.Net.Http.Json;
+using System.Collections.Concurrent;
 using Microsoft.Extensions.Logging;
 using RobloxAutoManager.Core.Models;
 using RobloxAutoManager.Core.Services;
-using RobloxAutoManager.Core.Utils;
+using RobloxAutoManager.Watcher.Auth;
 
 public sealed class CookieRefresher : ICookieRefresher
 {
+    private readonly RobloxAuthClient _auth;
+    private readonly CookieJar _jar;
     private readonly ILogger<CookieRefresher> _logger;
-    private readonly Dictionary<string, DateTime> _lastRefresh = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ILogService _logs;
+
+    private readonly ConcurrentDictionary<string, DateTimeOffset> _lastRefresh =
+        new(StringComparer.OrdinalIgnoreCase);
+
     private static readonly TimeSpan RefreshInterval = TimeSpan.FromHours(6);
 
-    // Roblox CSRF token endpoint — cookie geçerliyse yeni token döner
-    private const string CsrfEndpoint = "https://auth.roblox.com/v2/login";
-    private const string ValidateEndpoint = "https://users.roblox.com/v1/users/authenticated";
-
-    public CookieRefresher(ILogger<CookieRefresher> logger)
+    public CookieRefresher(
+        RobloxAuthClient auth,
+        CookieJar jar,
+        ILogService logs,
+        ILogger<CookieRefresher> logger)
     {
+        _auth = auth;
+        _jar = jar;
+        _logs = logs;
         _logger = logger;
     }
 
@@ -26,42 +35,58 @@ public sealed class CookieRefresher : ICookieRefresher
     {
         if (!_lastRefresh.TryGetValue(account.Username, out var last))
             return true;
-        return DateTime.UtcNow - last > RefreshInterval;
+
+        return DateTimeOffset.UtcNow - last > RefreshInterval;
     }
 
+    /// Güncel cookie'yi döner. Ölüyse null.
+    /// POST /v1/session/refresh Set-Cookie'yi zorla tetikler — Roblox staff workaround.
     public async Task<string?> RefreshAsync(Account account, CancellationToken ct = default)
     {
-        try
-        {
-            // 1. Mevcut cookie'yi validate et
-            var validReq = RobloxHttpClient.CreateRequest(HttpMethod.Get, ValidateEndpoint, account.Cookie);
-            var validResp = await RobloxHttpClient.Instance.SendAsync(validReq, ct);
+        string seed = _jar.Get(account.Username) ?? account.Cookie;
 
-            if (validResp.IsSuccessStatusCode)
+        if (string.IsNullOrWhiteSpace(seed))
+        {
+            _logs.Log(LogLevel.Warning, "Cookie", "No cookie available", account.Username);
+            return null;
+        }
+
+        _jar.Set(account.Username, seed);
+
+        bool ok = await _auth.ForceSessionRefreshAsync(account.Username, ct);
+
+        if (!ok)
+        {
+            // Refresh başarısız — cookie hâlâ geçerli olabilir, validate ile teyit et
+            var check = await _auth.ValidateAsync(account.Username, seed, ct);
+
+            if (!check.Success)
             {
-                // Cookie hala geçerli — sadece timestamp güncelle
-                _lastRefresh[account.Username] = DateTime.UtcNow;
-                _logger.LogDebug("Cookie still valid for {User}. Refresh timer reset.", account.Username);
-                return account.Cookie;
+                _logs.Log(LogLevel.Error, "Cookie",
+                    $"Cookie dead ({check.Health}). Re-auth required.", account.Username, check.Error);
+                return null;
             }
+        }
 
-            // 2. Cookie expired — refresh dene
-            // NOT: Roblox gerçek refresh için username/password veya refresh token ister.
-            // Bu implementasyon cookie validity check + cache mekanizmasıdır.
-            // Tam refresh için external auth provider entegrasyonu gerekir (Phase 4).
-            
-            _logger.LogWarning("Cookie expired for {User}. Manual re-login required.", account.Username);
-            return null;
-        }
-        catch (Exception ex)
+        _lastRefresh[account.Username] = DateTimeOffset.UtcNow;
+
+        string current = _jar.Get(account.Username) ?? seed;
+
+        if (!string.Equals(current, account.Cookie, StringComparison.Ordinal))
         {
-            _logger.LogError(ex, "Cookie refresh failed for {User}", account.Username);
-            return null;
+            _logs.Log(LogLevel.Info, "Cookie",
+                "Cookie rotated during refresh cycle", account.Username);
         }
+
+        return current;
     }
 
     public void MarkRefreshed(string username)
+        => _lastRefresh[username] = DateTimeOffset.UtcNow;
+
+    public void Forget(string username)
     {
-        _lastRefresh[username] = DateTime.UtcNow;
+        _lastRefresh.TryRemove(username, out _);
+        _jar.Remove(username);
     }
 }

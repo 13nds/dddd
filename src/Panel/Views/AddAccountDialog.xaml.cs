@@ -1,18 +1,23 @@
 // src/Panel/Views/AddAccountDialog.xaml.cs
 namespace RobloxAutoManager.Panel.Views;
 
-using System.Net.Http.Json;
 using System.Windows;
+using System.Windows.Media;
 using RobloxAutoManager.Core.Models;
-using RobloxAutoManager.Core.Utils;
+using RobloxAutoManager.Watcher.Auth;
 
 public partial class AddAccountDialog : Window
 {
+    private readonly RobloxAuthClient _auth;
+    private readonly CookieJar _jar;
+
     public Account? Result { get; private set; }
 
-    public AddAccountDialog()
+    public AddAccountDialog(RobloxAuthClient auth, CookieJar jar)
     {
         InitializeComponent();
+        _auth = auth;
+        _jar = jar;
     }
 
     private async void Add_Click(object sender, RoutedEventArgs e)
@@ -22,31 +27,48 @@ public partial class AddAccountDialog : Window
 
         if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(cookie))
         {
-            ValidationStatus.Foreground = System.Windows.Media.Brushes.Parse("#F44336");
-            ValidationStatus.Text = "All fields required.";
+            SetStatus("All fields required.", "#F44336");
             return;
         }
 
         AddBtn.IsEnabled = false;
-        ValidationStatus.Foreground = System.Windows.Media.Brushes.Gray;
-        ValidationStatus.Text = "Validating cookie...";
+        SetStatus("Validating cookie...", "#9E9E9E");
 
-        bool valid = await ValidateRobloxCookieAsync(cookie);
-
-        if (valid)
+        try
         {
+            var result = await _auth.ValidateAsync(username, cookie);
+
+            if (!result.Success)
+            {
+                string reason = result.Health switch
+                {
+                    SessionHealth.CookieInvalid => "Cookie invalid or expired.",
+                    SessionHealth.RateLimited => "Rate limited. Wait and retry.",
+                    SessionHealth.NetworkDown => "Network unreachable.",
+                    _ => result.Error ?? "Validation failed."
+                };
+
+                SetStatus(reason, "#F44336");
+                AddBtn.IsEnabled = true;
+                return;
+            }
+
+            // Rotasyon olduysa jar'daki güncel değeri al — eski cookie'yi saklama
+            string effectiveCookie = _jar.Get(result.Username) ?? cookie;
+
             Result = new Account(
-                Username: username,
-                Cookie: cookie,
-                TargetServer: new ServerConfig(PlaceId: 0) // Default, settings'den değişecek
+                Username: result.Username,
+                Cookie: effectiveCookie,
+                TargetServer: new ServerConfig(PlaceId: 0),
+                UserId: result.UserId
             );
+
             DialogResult = true;
             Close();
         }
-        else
+        catch (Exception ex)
         {
-            ValidationStatus.Foreground = System.Windows.Media.Brushes.Parse("#F44336");
-            ValidationStatus.Text = "Invalid or expired cookie.";
+            SetStatus($"Error: {ex.Message}", "#F44336");
             AddBtn.IsEnabled = true;
         }
     }
@@ -57,17 +79,9 @@ public partial class AddAccountDialog : Window
         Close();
     }
 
-    private static async Task<bool> ValidateRobloxCookieAsync(string cookie)
+    private void SetStatus(string text, string hexColor)
     {
-        try
-        {
-            var req = RobloxHttpClient.CreateRequest(HttpMethod.Get, "https://users.roblox.com/v1/users/authenticated", cookie);
-            var resp = await RobloxHttpClient.Instance.SendAsync(req);
-            return resp.IsSuccessStatusCode;
-        }
-        catch
-        {
-            return false;
-        }
+        ValidationStatus.Foreground = (Brush)new BrushConverter().ConvertFromString(hexColor)!;
+        ValidationStatus.Text = text;
     }
 }

@@ -1,19 +1,28 @@
+// src/Watcher/AccountWatcher.cs
 namespace RobloxAutoManager.Watcher;
 
 using System.Collections.Concurrent;
+using Microsoft.Extensions.Logging;
 using RobloxAutoManager.Core.Models;
 using RobloxAutoManager.Core.Services;
-using RobloxAutoManager.Core.Utils;
-using Microsoft.Extensions.Logging;
+using RobloxAutoManager.Watcher.Auth;
 
 public sealed class AccountWatcher : IAccountWatcher
 {
     private readonly ConcurrentDictionary<string, Account> _accounts = new(StringComparer.OrdinalIgnoreCase);
     private readonly IRobloxLauncher _launcher;
     private readonly RejoinStrategy _rejoin;
+    private readonly ICookieRefresher _refresher;
+    private readonly CookieJar _jar;
+    private readonly ILogService _logs;
     private readonly ILogger<AccountWatcher> _logger;
+
+    private readonly SemaphoreSlim _lifecycleGate = new(1, 1);
     private CancellationTokenSource? _cts;
     private Task? _watchLoop;
+    private bool _disposed;
+
+    private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
 
     public event Action<Account>? AccountStateChanged;
 
@@ -22,17 +31,27 @@ public sealed class AccountWatcher : IAccountWatcher
     public AccountWatcher(
         IRobloxLauncher launcher,
         RejoinStrategy rejoin,
+        ICookieRefresher refresher,
+        CookieJar jar,
+        ILogService logs,
         ILogger<AccountWatcher> logger)
     {
         _launcher = launcher;
         _rejoin = rejoin;
+        _refresher = refresher;
+        _jar = jar;
+        _logs = logs;
         _logger = logger;
     }
 
     public Task AddAccountAsync(Account account, CancellationToken ct = default)
     {
         _accounts[account.Username] = account;
-        _logger.LogInformation("Added account: {User}", account.Username);
+
+        if (account.HasCookie)
+            _jar.Set(account.Username, account.Cookie);
+
+        _logs.Log(LogLevel.Info, "Watcher", $"Account added (UserId={account.UserId})", account.Username);
         NotifyStateChange(account);
         return Task.CompletedTask;
     }
@@ -42,8 +61,10 @@ public sealed class AccountWatcher : IAccountWatcher
         if (_accounts.TryRemove(username, out var removed))
         {
             _rejoin.ResetCounter(username);
-            _logger.LogInformation("Removed account: {Username}", username);
-            NotifyStateChange(removed with { State = AccountState.Offline });
+            _jar.Remove(username);
+
+            _logs.Log(LogLevel.Info, "Watcher", "Account removed", username);
+            NotifyStateChange(removed with { State = AccountState.Offline, LastError = "__REMOVED__" });
         }
         return Task.CompletedTask;
     }
@@ -52,62 +73,176 @@ public sealed class AccountWatcher : IAccountWatcher
     {
         if (_accounts.TryGetValue(username, out var acc))
         {
-            _accounts[username] = acc with { TargetServer = config };
-            _logger.LogInformation("Updated server config for {User}: Place={Place}, Job={Job}",
-                username, config.PlaceId, config.JobId ?? "none");
+            var updated = acc with { TargetServer = config };
+            _accounts[username] = updated;
+
+            _logs.Log(LogLevel.Info, "Watcher",
+                $"Server config updated: Place={config.PlaceId}, Job={config.JobId ?? "none"}", username);
+
+            NotifyStateChange(updated);
         }
         return Task.CompletedTask;
     }
 
-    public Task StartWatchingAsync(CancellationToken ct = default)
+    public async Task StartWatchingAsync(CancellationToken ct = default)
     {
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        _watchLoop = Task.Run(() => WatchLoopAsync(_cts.Token), _cts.Token);
-        _logger.LogInformation("Account watcher started. Monitoring {Count} accounts.", _accounts.Count);
-        return Task.CompletedTask;
+        await _lifecycleGate.WaitAsync(ct);
+        try
+        {
+            if (_cts is not null)
+            {
+                _logger.LogDebug("Watcher already running.");
+                return;
+            }
+
+            _cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            _watchLoop = Task.Run(() => WatchLoopAsync(_cts.Token));
+
+            _logs.Log(LogLevel.Info, "Watcher", $"Started. Monitoring {_accounts.Count} accounts.");
+        }
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     public async Task StopWatchingAsync(CancellationToken ct = default)
     {
-        if (_cts != null)
+        await _lifecycleGate.WaitAsync(ct);
+        try
         {
-            await _cts.CancelAsync();
-            if (_watchLoop != null)
-                await _watchLoop.WaitAsync(ct);
-            _cts.Dispose();
+            if (_cts is null) return;
+
+            var loop = _watchLoop;
+            var cts = _cts;
+
             _cts = null;
+            _watchLoop = null;
+
+            await cts.CancelAsync();
+
+            if (loop is not null)
+            {
+                try { await loop.WaitAsync(TimeSpan.FromSeconds(10), ct); }
+                catch (OperationCanceledException) { /* beklenen */ }
+                catch (TimeoutException) { _logger.LogWarning("Watch loop did not stop within 10s."); }
+                catch (Exception ex) { _logger.LogError(ex, "Watch loop faulted on shutdown."); }
+            }
+
+            cts.Dispose();
+            _logs.Log(LogLevel.Info, "Watcher", "Stopped.");
         }
-        _logger.LogInformation("Account watcher stopped.");
+        finally
+        {
+            _lifecycleGate.Release();
+        }
     }
 
     private async Task WatchLoopAsync(CancellationToken ct)
     {
         while (!ct.IsCancellationRequested)
         {
-            foreach (var kvp in _accounts)
+            foreach (var kvp in _accounts.ToArray())
             {
                 if (ct.IsCancellationRequested) break;
 
-                var account = kvp.Value;
-                bool running = await _launcher.IsRunningAsync(account.Username, ct);
-
-                AccountState newState = running ? AccountState.InGame : AccountState.Offline;
-
-                if (newState != account.State)
+                try
                 {
-                    var updated = account with { State = newState, LastChecked = DateTime.UtcNow };
-                    _accounts[account.Username] = updated;
-                    NotifyStateChange(updated);
-
-                    if (newState == AccountState.Offline && account.State == AccountState.InGame)
-                    {
-                        // Crash / disconnect detected → auto-rejoin
-                        _ = _rejoin.HandleDisconnectAsync(updated, ct);
-                    }
+                    await CheckAccountAsync(kvp.Value, ct);
+                }
+                catch (OperationCanceledException) when (ct.IsCancellationRequested)
+                {
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    // Tek hesabın hatası tüm döngüyü öldürmesin
+                    _logs.Log(LogLevel.Error, "Watcher",
+                        $"Check failed: {ex.GetType().Name}", kvp.Key, ex.Message);
                 }
             }
 
-            await Task.Delay(TimeSpan.FromSeconds(5), ct);
+            try { await Task.Delay(PollInterval, ct); }
+            catch (OperationCanceledException) { return; }
+        }
+    }
+
+    private async Task CheckAccountAsync(Account account, CancellationToken ct)
+    {
+        // 1. Cookie sağlığı — süresi geldiyse yenile
+        if (_refresher.NeedsRefresh(account))
+        {
+            string? fresh = await _refresher.RefreshAsync(account, ct);
+
+            if (fresh is null)
+            {
+                var dead = account with
+                {
+                    State = AccountState.Error,
+                    LastChecked = DateTime.UtcNow,
+                    LastError = "Cookie expired — re-add account"
+                };
+                _accounts[account.Username] = dead;
+                NotifyStateChange(dead);
+                return;
+            }
+
+            if (!string.Equals(fresh, account.Cookie, StringComparison.Ordinal))
+            {
+                account = account with { Cookie = fresh };
+                _accounts[account.Username] = account;
+            }
+        }
+
+        // 2. Process durumu
+        bool running = await _launcher.IsRunningAsync(account.Username, ct);
+        var previous = account.State;
+
+        AccountState newState = running ? AccountState.InGame : AccountState.Offline;
+
+        if (newState == previous)
+        {
+            // Durum aynı ama timestamp tazele
+            var tick = account with { LastChecked = DateTime.UtcNow };
+            _accounts[account.Username] = tick;
+            return;
+        }
+
+        var updated = account with { State = newState, LastChecked = DateTime.UtcNow };
+        _accounts[account.Username] = updated;
+        NotifyStateChange(updated);
+
+        // 3. Oyundayken düştüyse → yeniden katıl
+        if (previous == AccountState.InGame && newState == AccountState.Offline && account.HasTarget)
+        {
+            _logs.Log(LogLevel.Warning, "Watcher", "Disconnect detected, scheduling rejoin", account.Username);
+
+            var rejoining = updated with { State = AccountState.Rejoining };
+            _accounts[account.Username] = rejoining;
+            NotifyStateChange(rejoining);
+
+            _ = SafeRejoinAsync(rejoining, ct);
+        }
+    }
+
+    private async Task SafeRejoinAsync(Account account, CancellationToken ct)
+    {
+        try
+        {
+            await _rejoin.HandleDisconnectAsync(account, ct);
+        }
+        catch (OperationCanceledException) { /* shutdown */ }
+        catch (Exception ex)
+        {
+            _logs.Log(LogLevel.Error, "Watcher",
+                $"Rejoin failed: {ex.Message}", account.Username, ex.ToString());
+
+            if (_accounts.TryGetValue(account.Username, out var cur))
+            {
+                var errored = cur with { State = AccountState.Error, LastError = ex.Message };
+                _accounts[account.Username] = errored;
+                NotifyStateChange(errored);
+            }
         }
     }
 
@@ -119,6 +254,10 @@ public sealed class AccountWatcher : IAccountWatcher
 
     public async ValueTask DisposeAsync()
     {
-        await StopWatchingAsync();
+        if (_disposed) return;
+        _disposed = true;
+
+        try { await StopWatchingAsync(); } catch { /* best effort */ }
+        _lifecycleGate.Dispose();
     }
 }

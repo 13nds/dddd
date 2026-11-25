@@ -4,7 +4,6 @@ namespace RobloxAutoManager.Panel;
 using System.ComponentModel;
 using System.Windows;
 using System.Windows.Controls;
-using Microsoft.Extensions.DependencyInjection;
 using RobloxAutoManager.Core.Models;
 using RobloxAutoManager.Core.Services;
 using RobloxAutoManager.Panel.ViewModels;
@@ -47,9 +46,15 @@ public partial class MainWindow : Window
         Loaded += OnLoaded;
     }
 
+    /// Tray "Exit" veya gerçek kapatma isteği. X tuşu buna dokunmaz.
+    public void RequestForceClose()
+    {
+        _forceClose = true;
+        Close();
+    }
+
     private void BuildTabs()
     {
-        // XAML'de AccountsTab / LogsTab / QuotaTab / SettingsHost tanımlı olmalı.
         if (LogsTab != null) LogsTab.Content = _logViewer;
         if (QuotaTab != null) QuotaTab.Content = _rateMonitor;
     }
@@ -62,7 +67,7 @@ public partial class MainWindow : Window
         {
             if (AccountGrid.SelectedItem is not Account account)
             {
-                if (SettingsHost != null) SettingsHost.Content = BuildEmptySettingsHint();
+                if (SettingsHost != null) SettingsHost.Content = BuildHint(null);
                 return;
             }
 
@@ -73,11 +78,7 @@ public partial class MainWindow : Window
     private void WireCommands()
     {
         _viewModel.RequestOpenSettings += OpenSettingsFor;
-        _viewModel.RequestForceQuit += () =>
-        {
-            _forceClose = true;
-            Close();
-        };
+        _viewModel.RequestForceQuit += RequestForceClose;
     }
 
     private void OpenSettingsFor(string username)
@@ -86,22 +87,22 @@ public partial class MainWindow : Window
 
         try
         {
-            var view = _settingsFactory(username);
-            SettingsHost.Content = view;
+            SettingsHost.Content = _settingsFactory(username);
 
             if (MainTabs != null && SettingsTab != null)
                 MainTabs.SelectedItem = SettingsTab;
 
-            _logs.Log(LogLevel.Debug, "Panel", $"Settings opened for {username}", username);
+            _logs.Log(LogLevel.Debug, "Panel", $"Settings opened", username);
         }
         catch (Exception ex)
         {
-            _logs.Log(LogLevel.Error, "Panel", $"Failed to open settings: {ex.Message}", username, ex.ToString());
-            SettingsHost.Content = BuildEmptySettingsHint("Settings could not be loaded.");
+            _logs.Log(LogLevel.Error, "Panel",
+                $"Failed to open settings: {ex.Message}", username, ex.ToString());
+            SettingsHost.Content = BuildHint("Settings could not be loaded.");
         }
     }
 
-    private static TextBlock BuildEmptySettingsHint(string? message = null) => new()
+    private static TextBlock BuildHint(string? message) => new()
     {
         Text = message ?? "Select an account from the Accounts tab to edit its server configuration.",
         Foreground = System.Windows.Media.Brushes.Gray,
@@ -110,14 +111,17 @@ public partial class MainWindow : Window
         TextWrapping = TextWrapping.Wrap
     };
 
-    private async void OnLoaded(object sender, RoutedEventArgs e)
+    private void OnLoaded(object sender, RoutedEventArgs e)
     {
         foreach (var account in _watcher.Accounts)
-            if (!_viewModel.Accounts.Any(a => a.Username == account.Username))
+        {
+            if (!_viewModel.Accounts.Any(a =>
+                    a.Username.Equals(account.Username, StringComparison.OrdinalIgnoreCase)))
                 _viewModel.Accounts.Add(account);
+        }
 
-        _logs.Log(LogLevel.Info, "Panel", $"Window loaded. {_viewModel.Accounts.Count} accounts in view.");
-        await Task.CompletedTask;
+        _logs.Log(LogLevel.Info, "Panel",
+            $"Window loaded. {_viewModel.Accounts.Count} accounts in view.");
     }
 
     protected override void OnClosing(CancelEventArgs e)
@@ -128,10 +132,8 @@ public partial class MainWindow : Window
             return;
         }
 
-        // X = tray'e küçült, uygulamayı öldürme.
         e.Cancel = true;
         Hide();
-
         _logs.Log(LogLevel.Debug, "Panel", "Window hidden to tray.");
     }
 
@@ -139,7 +141,7 @@ public partial class MainWindow : Window
     {
         base.OnStateChanged(e);
 
-        if (WindowState == WindowState.Minimized)
+        if (WindowState == WindowState.Minimized && !_forceClose)
         {
             Hide();
             _logs.Log(LogLevel.Debug, "Panel", "Minimized to tray.");
