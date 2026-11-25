@@ -1,0 +1,38 @@
+<!-- src/Panel/Views/SettingsView.xaml -->
+<UserControl x:Class="RobloxAutoManager.Panel.Views.SettingsView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="#1E1E1E">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+        </Grid.RowDefinitions>
+        
+        <TextBlock Grid.Row="0" Text="Server Configuration" FontSize="18" Foreground="White" Margin="0,0,0,16"/>
+        
+        <TextBlock Grid.Row="1" Text="Place ID" Foreground="#CCC" Margin="0,0,0,4"/>
+        <TextBox x:Name="PlaceIdBox" Grid.Row="2" Padding="8,6" Background="#2D2D2D" 
+                 Foreground="White" BorderBrush="#3F3F3F" Margin="0,0,0,12"/>
+        
+        <TextBlock Grid.Row="3" Text="Job ID (optional)" Foreground="#CCC" Margin="0,0,0,4"/>
+        <TextBox x:Name="JobIdBox" Grid.Row="4" Padding="8,6" Background="#2D2D2D" 
+                 Foreground="White" BorderBrush="#3F3F3F" Margin="0,0,0,12"/>
+        
+        <StackPanel Grid.Row="5" Orientation="Vertical">
+            <TextBlock Text="Rejoin Priority" Foreground="#CCC" Margin="0,0,0,4"/>
+            <ComboBox x:Name="PriorityCombo" Background="#2D2D2D" Foreground="White" Padding="8,6" Margin="0,0,0,16">
+                <ComboBoxItem Content="Job ID First"/>
+                <ComboBoxItem Content="Custom URL First"/>
+                <ComboBoxItem Content="Place Only"/>
+            </ComboBox>
+            
+            <Button Content="Save Config" Padding="16,8" HorizontalAlignment="Left"
+                    Background="#2E7D32" Foreground="White" BorderThickness="0" Click="Save_Click"/>
+        </StackPanel>
+    </Grid>
+</UserControl>

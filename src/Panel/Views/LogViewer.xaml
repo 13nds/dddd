@@ -1,0 +1,74 @@
+<!-- src/Panel/Views/LogViewer.xaml -->
+<UserControl x:Class="RobloxAutoManager.Panel.Views.LogViewer"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             Background="#1E1E1E">
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="40"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="30"/>
+        </Grid.RowDefinitions>
+        
+        <!-- Filter Bar -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="8,6">
+            <TextBox x:Name="SearchBox" Width="200" Padding="6,4" Background="#2D2D2D" 
+                     Foreground="White" BorderBrush="#3F3F3F" ToolTip="Search logs..." TextChanged="OnFilterChanged"/>
+            
+            <ComboBox x:Name="LevelFilter" Width="100" Margin="8,0" Background="#2D2D2D" 
+                      Foreground="White" SelectionChanged="OnFilterChanged">
+                <ComboBoxItem Content="All Levels"/>
+                <ComboBoxItem Content="Info+"/>
+                <ComboBoxItem Content="Warning+"/>
+                <ComboBoxItem Content="Error+"/>
+            </ComboBox>
+            
+            <ComboBox x:Name="UserFilter" Width="150" Margin="0,0,8,0" Background="#2D2D2D" 
+                      Foreground="White" SelectionChanged="OnFilterChanged"/>
+            
+            <Button Content="Export JSON" Padding="12,4" Background="#0078D4" Foreground="White" 
+                    BorderThickness="0" Click="Export_Click"/>
+            <Button Content="Clear" Padding="12,4" Margin="8,0,0,0" Background="#C62828" Foreground="White" 
+                    BorderThickness="0" Click="Clear_Click"/>
+        </StackPanel>
+        
+        <!-- Virtualized Log List -->
+        <ListView x:Name="LogList" Grid.Row="1" Background="#252525" BorderThickness="0"
+                  VirtualizingPanel.IsVirtualizing="True" VirtualizingPanel.VirtualizationMode="Recycling">
+            <ListView.ItemTemplate>
+                <DataTemplate>
+                    <Grid Margin="4,2">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="90"/>
+                            <ColumnDefinition Width="60"/>
+                            <ColumnDefinition Width="120"/>
+                            <ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        
+                        <TextBlock Grid.Column="0" Text="{Binding FormattedTime}" Foreground="#888" FontFamily="Consolas" FontSize="11"/>
+                        <TextBlock Grid.Column="1" Text="{Binding Level}" FontWeight="Bold" FontSize="11">
+                            <TextBlock.Style>
+                                <Style TargetType="TextBlock">
+                                    <Setter Property="Foreground" Value="#CCC"/>
+                                    <Style.Triggers>
+                                        <DataTrigger Binding="{Binding Level}" Value="Info"><Setter Property="Foreground" Value="#4FC3F7"/></DataTrigger>
+                                        <DataTrigger Binding="{Binding Level}" Value="Warning"><Setter Property="Foreground" Value="#FFB74D"/></DataTrigger>
+                                        <DataTrigger Binding="{Binding Level}" Value="Error"><Setter Property="Foreground" Value="#EF5350"/></DataTrigger>
+                                        <DataTrigger Binding="{Binding Level}" Value="Fatal"><Setter Property="Foreground" Value="#FF1744"/></DataTrigger>
+                                    </Style.Triggers>
+                                </Style>
+                            </TextBlock.Style>
+                        </TextBlock>
+                        <TextBlock Grid.Column="2" Text="{Binding Username}" Foreground="#AAA" FontSize="11" Margin="4,0"/>
+                        <TextBlock Grid.Column="3" Text="{Binding Message}" Foreground="White" FontSize="11" TextTrimming="CharacterEllipsis"/>
+                    </Grid>
+                </DataTemplate>
+            </ListView.ItemTemplate>
+        </ListView>
+        
+        <!-- Status Bar -->
+        <Border Grid.Row="2" Background="#252525" Padding="8,0">
+            <TextBlock x:Name="CountLabel" Foreground="#888" VerticalAlignment="Center" FontSize="11"/>
+        </Border>
+    </Grid>
+</UserControl>
